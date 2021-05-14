@@ -85,8 +85,53 @@ class InspectingDebugListener : XDebugSessionListener {
   }
 
 
+  override fun sessionPaused() {
+    val service = service<RequesterStorageService>()
+    val proj = service.project
+    val xDebugProcess = xSession.debugProcess
+    val process = DebuggerManager.getInstance(proj).getDebugProcess(xDebugProcess.processHandler)
 
-  private fun tryLoadClass(evalContextImpl: EvaluationContextImpl,
+
+    if (process != null) {
+      val vm = process.virtualMachineProxy as VirtualMachineProxyImpl
+      requestManager = vm.eventRequestManager()
+      val processImpl = process as DebugProcessImpl
+      val context = processImpl.suspendManager.pausedContext
+
+      val threadRef = context.thread!!.threadReference
+      threadProxy = vm.getThreadReferenceProxy(threadRef)!!
+
+      val eval = xDebugProcess.evaluator
+      if (eval != null) {
+        myEvaluator = eval
+      }
+
+
+      DebugProcessEvents.enableRequestWithHandler(createExitRequest(), SwappingOnExitHandler())
+
+      var ctx = if (context.evaluationContext != null) {
+        context.evaluationContext
+      } else {
+        processImpl.debuggerContext.createEvaluationContext()!!
+      }
+
+      ctx = ctx.withAutoLoadClasses(true)
+
+      //val peekInspectorClassType = retrievePeekCallClassType(ctx)?: return
+      val classLoader = ClassLoadingUtils.getClassLoader(ctx, ctx.debugProcess)
+      loadAdditionalClasses(ctx, classLoader)
+      peekArgsMethodValue = setUpPeekArgumentValue(ctx, classLoader)
+      val a = 1
+    }
+  }
+
+  // for load
+  private fun loadAdditionalClasses(evalContextImpl: EvaluationContextImpl, classLoader: ClassLoaderReference) {
+    val toLoadKeys = ClassLoaderHelper.getAdditionalClasses()
+    toLoadKeys.forEach { tryLoadClass(evalContextImpl, classLoader, it) }
+  }
+
+  private fun tryLoadClass(evalContextImpl: EvaluationContextImpl, classLoader: ClassLoaderReference,
                            loadOption: ClassLoaderHelper.Companion.LoadClasses =
                              ClassLoaderHelper.Companion.LoadClasses.PeekInspector): ReferenceType? {
     val process = evalContextImpl.debugProcess as DebugProcessImpl
@@ -100,7 +145,6 @@ class InspectingDebugListener : XDebugSessionListener {
     )
 
     //evalContextImpl.isAutoLoadClasses = true
-    val classLoader = ClassLoadingUtils.getClassLoader(evalContextImpl, process)
 
 
     if (loadOption != ClassLoaderHelper.Companion.LoadClasses.JavaConsumer) {
@@ -126,76 +170,27 @@ class InspectingDebugListener : XDebugSessionListener {
   }
 
 
-  private fun retrievePeekCallClassType(evalContextImpl: EvaluationContextImpl): ClassType? {
+  private fun retrievePeekCallClassType(evalContextImpl: EvaluationContextImpl, classLoader: ClassLoaderReference): ClassType? {
 
     val resultReference =  evalContextImpl.computeAndKeep<ClassObjectReference> {
       val start = System.currentTimeMillis()
 
-      val ref = tryLoadClass(evalContextImpl)
+      val ref = tryLoadClass(evalContextImpl, classLoader)
       val end = System.currentTimeMillis() - start
       logger.info("Loading of peek inspector took $end ms")
       ref?.classObject()
     }
 
-
     return resultReference.reflectedType() as ClassType
   }
 
 
-  override fun sessionPaused() {
-    val service = service<RequesterStorageService>()
-    val proj = service.project
-    val xDebugProcess = xSession.debugProcess
-    val process = DebuggerManager.getInstance(proj).getDebugProcess(xDebugProcess.processHandler)
 
-
-    if (process != null) {
-      val vm = process.virtualMachineProxy as VirtualMachineProxyImpl
-      requestManager = vm.eventRequestManager()
-      val processImpl = process as DebugProcessImpl
-      val context = processImpl.suspendManager.pausedContext
-
-      val threadRef = context.thread!!.threadReference
-      threadProxy = vm.getThreadReferenceProxy(threadRef)!!
-
-      val eval = xDebugProcess.evaluator
-      if (eval != null) {
-        myEvaluator = eval
-      }
-
-
-      DebugProcessEvents.enableRequestWithHandler(createExitRequest(), SwappingOnExitHandler())
-
-
-      var ctx = if (context.evaluationContext != null) {
-        context.evaluationContext
-      } else {
-        processImpl.debuggerContext.createEvaluationContext()!!
-      }
-
-      ctx = ctx.withAutoLoadClasses(true)
-
-      //val peekInspectorClassType = retrievePeekCallClassType(ctx)?: return
-      peekArgsMethodValue = setUpPeekArgumentValue(ctx)
-      val a = 1
-    }
-  }
-
-  private fun setUpPeekArgumentValue(evalContextImpl: EvaluationContextImpl, peekInspectorType: ClassType? = null): Value {
+  private fun setUpPeekArgumentValue(evalContextImpl: EvaluationContextImpl, classLoader: ClassLoaderReference,  peekInspectorType: ClassType? = null): Value {
     val processImpl = evalContextImpl.debugProcess
     val threadRef = threadProxy.threadReference
 
-    val innerConsumer = evalContextImpl.computeAndKeep{
-      val ref = tryLoadClass(evalContextImpl, ClassLoaderHelper.Companion.LoadClasses.PeekInspectorConsumer)
-      val classObj = ref?.classObject()!!
-      classObj
-      //var constructor = ref.methods().first {  it.name().contains("init") }
-      //val instance = processImpl.newInstance(evalContextImpl, classObj.reflectedType() as ClassType , constructor, listOf() )
-      //instance
-    }
-
-
-    val inspectorClassType = peekInspectorType ?: retrievePeekCallClassType(evalContextImpl)
+    val inspectorClassType = peekInspectorType ?: retrievePeekCallClassType(evalContextImpl, classLoader)
 
     val neededMethodConsumer = inspectorClassType!!.methods().first {
       it.name().endsWith("getPeekConsumer")
@@ -207,7 +202,6 @@ class InspectingDebugListener : XDebugSessionListener {
         it.name().contains("init")
       }
 
-      //processImpl.newInstance(evalContextImpl, inspectorClassType, constructor, listOf(innerConsumer))
       processImpl.newInstance(evalContextImpl, inspectorClassType, constructor, listOf())
     }
 
@@ -220,7 +214,6 @@ class InspectingDebugListener : XDebugSessionListener {
       throw e
     }
   }
-
 
 
   private fun evaluateArgument(): Value? {

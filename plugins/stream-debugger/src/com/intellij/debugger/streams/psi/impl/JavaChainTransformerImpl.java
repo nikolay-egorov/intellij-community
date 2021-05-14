@@ -3,6 +3,7 @@ package com.intellij.debugger.streams.psi.impl;
 
 import com.intellij.debugger.streams.psi.ChainTransformer;
 import com.intellij.debugger.streams.trace.dsl.impl.java.JavaTypes;
+import com.intellij.debugger.streams.trace.impl.handler.reactive.ReactorOnSignalCall;
 import com.intellij.debugger.streams.trace.impl.handler.type.GenericType;
 import com.intellij.debugger.streams.wrapper.CallArgument;
 import com.intellij.debugger.streams.wrapper.IntermediateStreamCall;
@@ -79,6 +80,11 @@ public class JavaChainTransformerImpl implements ChainTransformer.Java {
     final String name = resolveMethodName(expression);
     final List<CallArgument> args = resolveArguments(expression);
     final GenericType resultType = resolveTerminationCallType(expression);
+
+    if (ReactorOnSignalCall.Companion.getReactorTerminationOps().contains(name)) {
+      return new ReactorOnSignalCall.TerminationCallFactory(name, args, typeBefore, resultType, expression.getTextRange())
+          .resolveAndCreate();
+    }
     return new TerminatorStreamCallImpl(name, args, typeBefore, resultType, expression.getTextRange());
   }
 

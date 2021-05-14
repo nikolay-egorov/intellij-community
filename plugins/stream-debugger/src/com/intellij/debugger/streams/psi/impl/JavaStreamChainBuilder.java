@@ -57,7 +57,7 @@ public class JavaStreamChainBuilder implements StreamChainBuilder {
   }
 
   @Nullable
-  private static PsiElement toUpperLevel(@NotNull PsiElement element) {
+  protected static PsiElement toUpperLevel(@NotNull PsiElement element) {
     element = element.getParent();
     while (element != null && !(element instanceof PsiLambdaExpression) && !(element instanceof PsiAnonymousClass)) {
       element = element.getParent();
@@ -68,7 +68,7 @@ public class JavaStreamChainBuilder implements StreamChainBuilder {
 
   @Nullable
   @Contract("null -> null")
-  private static PsiElement getLatestElementInCurrentScope(@Nullable PsiElement element) {
+  protected static PsiElement getLatestElementInCurrentScope(@Nullable PsiElement element) {
     PsiElement current = element;
     while (current != null) {
       final PsiElement parent = current.getParent();
@@ -84,7 +84,7 @@ public class JavaStreamChainBuilder implements StreamChainBuilder {
   }
 
   @NotNull
-  private List<StreamChain> buildChains(@NotNull List<List<PsiMethodCallExpression>> chains, @NotNull PsiElement context) {
+  protected List<StreamChain> buildChains(@NotNull List<List<PsiMethodCallExpression>> chains, @NotNull PsiElement context) {
     return ContainerUtil.map(chains, x -> myChainTransformer.transform(x, context));
   }
 
@@ -105,9 +105,9 @@ public class JavaStreamChainBuilder implements StreamChainBuilder {
     }
   }
 
-  private class MyChainCollectorVisitor extends MyVisitorBase {
-    private final Set<PsiMethodCallExpression> myTerminationCalls = new HashSet<>();
-    private final Map<PsiMethodCallExpression, PsiMethodCallExpression> myPreviousCalls = new HashMap<>();
+  protected class MyChainCollectorVisitor extends MyVisitorBase {
+    protected final Set<PsiMethodCallExpression> myTerminationCalls = new HashSet<>();
+    protected final Map<PsiMethodCallExpression, PsiMethodCallExpression> myPreviousCalls = new LinkedHashMap<>();
 
     @Override
     public void visitMethodCallExpression(PsiMethodCallExpression expression) {

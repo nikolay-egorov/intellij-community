@@ -2,6 +2,8 @@
 package com.intellij.debugger.streams.action;
 
 import com.intellij.debugger.streams.lib.LibrarySupportProvider;
+import com.intellij.debugger.streams.lib.impl.reactive.ReactorSupportProvider;
+import com.intellij.debugger.streams.psi.impl.reactive.JavaReactiveStreamChainBuilder;
 import com.intellij.debugger.streams.wrapper.StreamChain;
 import com.intellij.debugger.streams.wrapper.StreamChainBuilder;
 import com.intellij.lang.Language;
@@ -18,6 +20,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Helps {@link TraceStreamAction} understand if there is a suitable chain under the debugger position or not.
@@ -54,13 +57,23 @@ class ChainResolver {
         if (LOG.isDebugEnabled()) {
           LOG.debug("Chains found:" + found);
         }
-        searchResult.updateStatus(found);
+        if (provider instanceof ReactorSupportProvider) {
+          var foundTerminal = ((JavaReactiveStreamChainBuilder)provider.getChainBuilder()).isFoundNonTerminalReactiveChain();
+          if (foundTerminal) {
+            searchResult.chainsStatus = ChainStatus.REACTIVE_NON_TERMINAL_FOUND;
+          } else {
+            searchResult.updateStatus(found);
+          }
+        } else {
+          searchResult.updateStatus(found);
+        }
       }).inSmartMode(elementAtDebugger.getProject()).submit(executor);
     }
   }
 
   @NotNull List<StreamChainWithLibrary> getChains(@NotNull PsiElement elementAtDebugger) {
-    if (!mySearchResult.isSuitableFor(elementAtDebugger) || !mySearchResult.chainsStatus.equals(ChainStatus.FOUND)) {
+    if (!mySearchResult.isSuitableFor(elementAtDebugger) || !(mySearchResult.chainsStatus.equals(ChainStatus.FOUND)
+        || mySearchResult.chainsStatus.equals(ChainStatus.REACTIVE_NON_TERMINAL_FOUND))) {
       LOG.error("Cannot build chains: " + mySearchResult.chainsStatus);
       return Collections.emptyList();
     }
@@ -68,12 +81,17 @@ class ChainResolver {
     // TODO: move to background
     List<StreamChainWithLibrary> chains = new ArrayList<>();
     String elementLanguageId = elementAtDebugger.getLanguage().getID();
+    AtomicInteger idx = new AtomicInteger(0);
     LibrarySupportProvider.EP_NAME.forEachExtensionSafe(provider -> {
       if (provider.getLanguageId().equals(elementLanguageId)) {
         StreamChainBuilder chainBuilder = provider.getChainBuilder();
         if (chainBuilder.isChainExists(elementAtDebugger)) {
           for (StreamChain x : chainBuilder.build(elementAtDebugger)) {
             chains.add(new StreamChainWithLibrary(x, provider));
+            if (chainBuilder instanceof JavaReactiveStreamChainBuilder) {
+             LOG.info("ReactiveStream with termination op: " + chains.get(idx.get()).chain.getTerminationCall());
+            }
+            idx.getAndIncrement();
           }
         }
       }
@@ -90,7 +108,8 @@ class ChainResolver {
     LANGUAGE_NOT_SUPPORTED,
     COMPUTING,
     FOUND,
-    NOT_FOUND
+    NOT_FOUND,
+    REACTIVE_NON_TERMINAL_FOUND
   }
 
   static final class StreamChainWithLibrary {

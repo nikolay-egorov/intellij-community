@@ -4,24 +4,30 @@ package com.intellij.debugger.streams.action;
 import com.intellij.debugger.engine.evaluation.EvaluationContextImpl;
 import com.intellij.debugger.streams.diagnostic.ex.TraceCompilationException;
 import com.intellij.debugger.streams.diagnostic.ex.TraceEvaluationException;
+import com.intellij.debugger.streams.inspect.service.RequesterStorageService;
 import com.intellij.debugger.streams.lib.LibrarySupportProvider;
 import com.intellij.debugger.streams.psi.DebuggerPositionResolver;
 import com.intellij.debugger.streams.psi.impl.DebuggerPositionResolverImpl;
 import com.intellij.debugger.streams.trace.*;
 import com.intellij.debugger.streams.trace.impl.TraceResultInterpreterImpl;
+import com.intellij.debugger.streams.trace.impl.handler.reactive.ReactorOnSignalCall;
 import com.intellij.debugger.streams.ui.ChooserOption;
 import com.intellij.debugger.streams.ui.impl.ElementChooserImpl;
 import com.intellij.debugger.streams.ui.impl.EvaluationAwareTraceWindow;
 import com.intellij.debugger.streams.wrapper.StreamChain;
 import com.intellij.openapi.actionSystem.AnAction;
 import com.intellij.openapi.actionSystem.AnActionEvent;
+import com.intellij.openapi.actionSystem.LangDataKeys;
 import com.intellij.openapi.actionSystem.Presentation;
 import com.intellij.openapi.application.ApplicationManager;
+import com.intellij.openapi.components.ServiceManager;
 import com.intellij.openapi.diagnostic.Logger;
 import com.intellij.openapi.editor.Editor;
+import com.intellij.openapi.fileEditor.FileDocumentManager;
 import com.intellij.openapi.fileEditor.FileEditorManager;
 import com.intellij.openapi.fileEditor.OpenFileDescriptor;
 import com.intellij.openapi.project.Project;
+import com.intellij.openapi.ui.Messages;
 import com.intellij.openapi.util.TextRange;
 import com.intellij.openapi.vfs.VirtualFile;
 import com.intellij.psi.PsiElement;
@@ -45,6 +51,9 @@ public final class TraceStreamAction extends AnAction {
   private static final ChainResolver CHAIN_RESOLVER = new ChainResolver();
   private final DebuggerPositionResolver myPositionResolver = new DebuggerPositionResolverImpl();
 
+  private boolean tappedTwiceForReactive = true;
+  private static final List<String> excludes = List.of("java.*", "javax.*", "sun.*", "com.sun.*");
+
   @Override
   public void update(@NotNull AnActionEvent e) {
     final XDebugSession session = getCurrentSession(e);
@@ -61,6 +70,19 @@ public final class TraceStreamAction extends AnAction {
           presentation.setEnabledAndVisible(false);
           break;
         case FOUND:
+        case REACTIVE_NON_TERMINAL_FOUND:
+          var service = ServiceManager.getService(RequesterStorageService.class);
+          var editor = e.getData(LangDataKeys.EDITOR);
+          if (editor == null) {
+            presentation.setEnabledAndVisible(true);
+            break;
+          }
+          var doc = editor.getDocument();
+          var currentFile = FileDocumentManager.getInstance().getFile(doc);
+          var chains = CHAIN_RESOLVER.getChains(element);
+          if (currentFile != null && !chains.isEmpty()) {
+            service.addNewChain(currentFile, chains.get(0).chain);
+          }
           presentation.setEnabledAndVisible(true);
           break;
         case COMPUTING:
@@ -91,7 +113,16 @@ public final class TraceStreamAction extends AnAction {
     }
 
     if (chains.size() == 1) {
+      if (chains.get(0).chain.getTerminationCall() instanceof ReactorOnSignalCall.AbsentTerminationCall && tappedTwiceForReactive) {
+        Messages.showMessageDialog(
+          e.getProject(), "Double click if you want to debug it. Note it will try to execute stream in a cold manner",
+          "Reactive stream with no termination call found", Messages.getInformationIcon()
+        );
+        tappedTwiceForReactive = false;
+        return;
+      }
       runTrace(chains.get(0).chain, chains.get(0).provider, session);
+      tappedTwiceForReactive = true;
     }
     else {
       Project project = session.getProject();
@@ -110,6 +141,14 @@ public final class TraceStreamAction extends AnAction {
     final EvaluationAwareTraceWindow window = new EvaluationAwareTraceWindow(session, chain);
     ApplicationManager.getApplication().invokeLater(window::show);
     final Project project = session.getProject();
+    //final var evaluationListener = new EvaluationListener(excludes);
+    //XDebugSession currentSession = XDebuggerManager.getInstance(project).getCurrentSession();
+    // old experiments
+    //currentSession.getContextManager().addListener(breakPListener);
+    //currentSession.getProcess().addEvaluationListener(evaluationListener);
+    //evaluationListener.setSubscribedProcess(currentSession.getProcess());
+    //evaluationListener.setChain(chain);
+
     final TraceExpressionBuilder expressionBuilder = provider.getExpressionBuilder(project);
     final TraceResultInterpreterImpl resultInterpreter = new TraceResultInterpreterImpl(provider.getLibrarySupport().getInterpreterFactory());
     final StreamTracer tracer = new EvaluateExpressionTracer(session, expressionBuilder, resultInterpreter);
@@ -119,17 +158,20 @@ public final class TraceStreamAction extends AnAction {
         final ResolvedTracingResult resolvedTrace = result.resolve(provider.getLibrarySupport().getResolverFactory());
         ApplicationManager.getApplication()
           .invokeLater(() -> window.setTrace(resolvedTrace, context));
+        //evaluationListener.evaluationCompleted();
       }
 
       @Override
       public void evaluationFailed(@NotNull String traceExpression, @NotNull String message) {
         notifyUI(message);
+        //evaluationListener.evaluationCompleted();
         throw new TraceEvaluationException(message, traceExpression);
       }
 
       @Override
       public void compilationFailed(@NotNull String traceExpression, @NotNull String message) {
         notifyUI(message);
+        //evaluationListener.evaluationCompleted();
         throw new TraceCompilationException(message, traceExpression);
       }
 

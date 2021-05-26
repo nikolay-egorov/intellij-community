@@ -2,12 +2,14 @@
 package com.intellij.debugger.streams.inspect
 
 import com.intellij.debugger.DebuggerManager
-import com.intellij.debugger.engine.*
+import com.intellij.debugger.engine.DebugProcessEvents
+import com.intellij.debugger.engine.DebugProcessImpl
+import com.intellij.debugger.engine.DebuggerManagerThreadImpl
+import com.intellij.debugger.engine.DebuggerUtils
 import com.intellij.debugger.engine.evaluation.EvaluateException
 import com.intellij.debugger.engine.evaluation.EvaluateExceptionUtil
 import com.intellij.debugger.engine.evaluation.EvaluationContextImpl
 import com.intellij.debugger.impl.ClassLoadingUtils
-import com.intellij.debugger.jdi.ObjectReferenceProxyImpl
 import com.intellij.debugger.jdi.ThreadReferenceProxyImpl
 import com.intellij.debugger.jdi.VirtualMachineProxyImpl
 import com.intellij.debugger.streams.inspect.service.RequesterStorageService
@@ -16,23 +18,21 @@ import com.intellij.openapi.components.service
 import com.intellij.openapi.diagnostic.logger
 import com.intellij.xdebugger.XDebugSession
 import com.intellij.xdebugger.XDebugSessionListener
-import com.intellij.xdebugger.evaluation.EvaluationMode
 import com.intellij.xdebugger.evaluation.XDebuggerEvaluator
-import com.intellij.xdebugger.frame.XValue
-import com.intellij.xdebugger.impl.breakpoints.XExpressionImpl
 import com.sun.jdi.*
 import com.sun.jdi.event.Event
-import com.sun.jdi.event.MethodEntryEvent
 import com.sun.jdi.event.MethodExitEvent
 import com.sun.jdi.request.EventRequest
 import com.sun.jdi.request.EventRequestManager
 import com.sun.jdi.request.MethodExitRequest
 import org.apache.commons.io.IOUtils
+import org.jetbrains.annotations.NotNull
 
 class InspectingDebugListener : XDebugSessionListener {
 
-  var peekArgsMethodValue : Value? = null
-
+  var peekCallInspector : Value? = null
+  var peekFluxConsumer : Value? = null
+  val loadedClassMap = mutableMapOf<ClassLoaderHelper.Companion.LoadClasses, Boolean>()
 
   inner class SwappingOnExitHandler : com.intellij.util.Consumer<Event> {
     override fun consume(e: Event?) {
@@ -40,27 +40,42 @@ class InspectingDebugListener : XDebugSessionListener {
         return
       }
 
-      if (e is MethodEntryEvent) {
-        myEvaluator = xSession.debugProcess.evaluator?: return
-        return
-      }
       val exitEv = e as MethodExitEvent
       val method = exitEv.method() ?: return
       val returnValue = exitEv.returnValue() ?: return
       if (!returnValue.toString().startsWith("instance of")) {
         return
       }
+      val type = returnValue.type()
       val newValue = createPeekCall(method, returnValue) ?: return
       threadProxy.forceEarlyReturn(newValue)
     }
   }
 
   private fun createPeekCall(method: Method, returnValue: Value): Value? {
-    myEvaluator ?: return null
-    val obj = returnValue as ObjectReferenceProxyImpl
-    val peekMethod = DebuggerUtils.findMethod(obj.referenceType(), "peek", null)
+    val obj = returnValue as ObjectReference
+    val peekMethod = DebuggerUtils.findMethod(obj.referenceType(), "doOnNext", null)
+    var shouldResume = false
+    val ans = try {
+      var ctx = evalContext!!
+      val suspendManager = ctx.debugProcess.suspendManager
+      shouldResume = ctx.suspendContext.isResumed
+      //if (shouldResume) {
+      //  evalContext!!.debugProcess.suspendManager.suspendThread(evalContext!!.suspendContext, threadProxy)
+      //  //ctx.suspendContext.setIsEvaluating(ctx)
+      //}
 
-    return obj.objectReference.invokeMethod(threadProxy.threadReference, peekMethod, listOf(peekArgsMethodValue!!), 0)
+      //evalContext!!.debugProcess.invokeInstanceMethod(ctx, obj, peekMethod!!, listOf(peekFluxConsumer!!), 0)
+      obj.invokeMethod(threadProxy.threadReference, peekMethod, listOf(peekFluxConsumer!!), 0)
+    } catch (e : Exception) {
+      throw e
+    }
+
+    if (shouldResume) {
+      evalContext!!.debugProcess.suspendManager.resume(evalContext!!.suspendContext)
+    }
+
+    return ans
   }
 
   private val logger = logger<InspectingDebugListener>()
@@ -69,6 +84,8 @@ class InspectingDebugListener : XDebugSessionListener {
   private lateinit var threadProxy: ThreadReferenceProxyImpl
   lateinit var xSession: XDebugSession
   var myEvaluator: XDebuggerEvaluator? = null
+  var evalContext: EvaluationContextImpl? = null
+
 
   private fun createExitRequest(): MethodExitRequest {
     DebuggerManagerThreadImpl.assertIsManagerThread() // to ensure EventRequestManager synchronization
@@ -94,6 +111,9 @@ class InspectingDebugListener : XDebugSessionListener {
 
     if (process != null) {
       val vm = process.virtualMachineProxy as VirtualMachineProxyImpl
+      if (peekCallInspector != null) {
+        return
+      }
       requestManager = vm.eventRequestManager()
       val processImpl = process as DebugProcessImpl
       val context = processImpl.suspendManager.pausedContext
@@ -115,12 +135,16 @@ class InspectingDebugListener : XDebugSessionListener {
         processImpl.debuggerContext.createEvaluationContext()!!
       }
 
-      ctx = ctx.withAutoLoadClasses(true)
+      if (peekCallInspector == null) {
+        ctx = ctx.withAutoLoadClasses(true)
 
-      //val peekInspectorClassType = retrievePeekCallClassType(ctx)?: return
-      val classLoader = ClassLoadingUtils.getClassLoader(ctx, ctx.debugProcess)
-      loadAdditionalClasses(ctx, classLoader)
-      peekArgsMethodValue = setUpPeekArgumentValue(ctx, classLoader)
+        val classLoader = ClassLoadingUtils.getClassLoader(ctx, ctx.debugProcess)
+        loadAdditionalClasses(ctx, classLoader)
+        peekCallInspector = setUpPeekInspector(ctx, classLoader)
+        evalContext = ctx
+        peekFluxConsumer = setUpPeekConsumer(ctx, classLoader, peekCallInspector as ObjectReference)
+      }
+
       val a = 1
     }
   }
@@ -144,17 +168,14 @@ class InspectingDebugListener : XDebugSessionListener {
       this::class.java.classLoader.getResourceAsStream(classPath)
     )
 
-    //evalContextImpl.isAutoLoadClasses = true
-
-
-    if (loadOption != ClassLoaderHelper.Companion.LoadClasses.JavaConsumer) {
+    if (loadOption != ClassLoaderHelper.Companion.LoadClasses.JavaConsumer && !loadedClassMap.contains(loadOption)) {
       try {
         ClassLoadingUtils.defineClass(className, bytes, evalContextImpl, process, classLoader)
       } catch (e: EvaluateException) {
         throw EvaluateExceptionUtil.createEvaluateException(e.message, e)
       }
     }
-
+    loadedClassMap.putIfAbsent(loadOption, true)
 
     return try {
       process.loadClass(evalContextImpl, className, classLoader)
@@ -185,60 +206,41 @@ class InspectingDebugListener : XDebugSessionListener {
   }
 
 
-
-  private fun setUpPeekArgumentValue(evalContextImpl: EvaluationContextImpl, classLoader: ClassLoaderReference,  peekInspectorType: ClassType? = null): Value {
+  private fun setUpPeekInspector(evalContextImpl: EvaluationContextImpl,
+                                classLoader: ClassLoaderReference,
+                                peekInspectorType: ClassType? = null): Value {
     val processImpl = evalContextImpl.debugProcess
-    val threadRef = threadProxy.threadReference
-
     val inspectorClassType = peekInspectorType ?: retrievePeekCallClassType(evalContextImpl, classLoader)
 
-    val neededMethodConsumer = inspectorClassType!!.methods().first {
-      it.name().endsWith("getPeekConsumer")
-    }
-
-    val inspectorInstance = evalContextImpl.computeAndKeep {
+    return evalContextImpl.computeAndKeep {
       // first is default, last is param-based
-      val constructor = inspectorClassType.methods().first() {
+      val constructor = inspectorClassType!!.methods().first() {
         it.name().contains("init")
       }
 
       processImpl.newInstance(evalContextImpl, inspectorClassType, constructor, listOf())
     }
+  }
 
+  private fun setUpPeekConsumer(evalContextImpl: EvaluationContextImpl, classLoader: ClassLoaderReference, peekInspectorInstance: ObjectReference? = null): Value {
+    val processImpl = evalContextImpl.debugProcess
+    val threadRef = threadProxy.threadReference
 
+    val inspectorClassType = retrievePeekCallClassType(evalContextImpl, classLoader)
+
+    val neededMethodConsumer = inspectorClassType!!.methods().first {
+      it.name().endsWith("getPeekConsumer")
+    }
+
+    val inspectorInstance = peekInspectorInstance ?: setUpPeekInspector(evalContextImpl, classLoader, inspectorClassType)
 
     return  try {
-      processImpl.invokeInstanceMethod(evalContextImpl, inspectorInstance, neededMethodConsumer, listOf(), 0)
+      processImpl.invokeInstanceMethod(evalContextImpl, inspectorInstance as @NotNull ObjectReference, neededMethodConsumer, listOf(), 0)
     }
     catch (e: Exception) {
       throw e
     }
   }
 
-
-  private fun evaluateArgument(): Value? {
-    var ans : Value? = null
-
-    val thisKlass = this.javaClass.classes
-
-    val inspectingClass = thisKlass.first { it.name.startsWith("PeekMethodInspector") }
-    val peekMethod = thisKlass[1].methods[0]
-
-
-    myEvaluator!!.evaluate(XExpressionImpl.fromText("PeekMethodInspector::fluxInspector", EvaluationMode.CODE_FRAGMENT), object : XDebuggerEvaluator.XEvaluationCallback {
-      override fun errorOccurred(errorMessage: String) {
-        logger.debug(errorMessage)
-      }
-
-      override fun evaluated(result: XValue) {
-        if (result is JavaValue) {
-          val desc = result.descriptor
-          ans = desc.value
-        }
-      }
-
-    }, null)
-    return ans
-  }
 
 }

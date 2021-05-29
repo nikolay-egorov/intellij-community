@@ -2,18 +2,19 @@
 package com.intellij.debugger.streams.inspect
 
 import com.intellij.debugger.DebuggerManager
-import com.intellij.debugger.engine.DebugProcessEvents
 import com.intellij.debugger.engine.DebugProcessImpl
 import com.intellij.debugger.engine.DebuggerManagerThreadImpl
 import com.intellij.debugger.engine.DebuggerUtils
 import com.intellij.debugger.engine.evaluation.EvaluateException
 import com.intellij.debugger.engine.evaluation.EvaluateExceptionUtil
 import com.intellij.debugger.engine.evaluation.EvaluationContextImpl
-import com.intellij.debugger.impl.ClassLoadingUtils
+import com.intellij.debugger.engine.requests.RequestManagerImpl
+import com.intellij.debugger.impl.*
 import com.intellij.debugger.jdi.ThreadReferenceProxyImpl
 import com.intellij.debugger.jdi.VirtualMachineProxyImpl
 import com.intellij.debugger.streams.inspect.service.RequesterStorageService
 import com.intellij.debugger.streams.inspect.util.ClassLoaderHelper
+import com.intellij.debugger.streams.inspect.util.FluxFilteredRequestor
 import com.intellij.openapi.components.service
 import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.project.Project
@@ -34,6 +35,20 @@ class InspectingDebugListener : XDebugSessionListener {
   var peekCallInspector : Value? = null
   var peekFluxConsumer : Value? = null
   val loadedClassMap = mutableMapOf<ClassLoaderHelper.Companion.LoadClasses, Boolean>()
+  val ctxListener = SimpleCtxListener()
+
+  var requestPair: Pair<Method, ObjectReference>? = null
+
+  inner class SimpleCtxListener : DebuggerContextListener {
+    override fun changeEvent(newContext: DebuggerContextImpl, event: DebuggerSession.Event?) {
+      if (event == DebuggerSession.Event.REFRESH || event == DebuggerSession.Event.CONTEXT) {
+        val a = newContext.suspendContext
+
+      }
+    }
+
+  }
+
 
   inner class SwappingOnExitHandler : com.intellij.util.Consumer<Event> {
     override fun consume(e: Event?) {
@@ -47,20 +62,25 @@ class InspectingDebugListener : XDebugSessionListener {
       if (!returnValue.toString().startsWith("instance of")) {
         return
       }
-      val type = returnValue.type()
+
+      val thread = e.thread()
       val newValue = createPeekCall(method, returnValue) ?: return
       threadProxy.forceEarlyReturn(newValue)
     }
   }
 
+
+
   private fun createPeekCall(method: Method, returnValue: Value): Value? {
     val obj = returnValue as ObjectReference
-    val peekMethod = DebuggerUtils.findMethod(obj.referenceType(), "doOnNext", null)
+    //val peekMethod = DebuggerUtils.findMethod(obj.referenceType(), "doOnNext", null)
+    val peekMethod = DebuggerUtils.findMethod(obj.referenceType(), "count", null)
     var shouldResume = false
     val ans = try {
       var ctx = evalContext!!
       val process = ctx.debugProcess
-      val debugManager = DebuggerManager.getInstance(getProject())
+      val debugManager = DebuggerManager.getInstance(getProject()) as DebuggerManagerImpl
+      val debugManagerCtx = debugManager.contextManager
       val processN = debugManager.getDebugProcess(xSession.debugProcess.processHandler)
       val processImpl = processN as DebugProcessImpl
       // they both null
@@ -70,13 +90,19 @@ class InspectingDebugListener : XDebugSessionListener {
       //  processImpl.debuggerContext.createEvaluationContext()!!
       //}
 
-      val suspendManager = ctx.debugProcess.suspendManager
-      //shouldResume = ctx.suspendContext.isResumed
-      val manager = process.suspendManager
+      if (debugManagerCtx.context.sourcePosition == null) {
+        debugManagerCtx.addListener(ctxListener)
+        requestPair = Pair(method, returnValue)
+        return null
+      } else {
+        debugManagerCtx.removeListener(ctxListener)
+      }
+      return null
+
 
       // wait() trap is either of them
       evalContext!!.debugProcess.invokeInstanceMethod(ctx, obj, peekMethod!!, listOf(peekFluxConsumer!!), ObjectReference.INVOKE_NONVIRTUAL)
-      //obj.invokeMethod(threadProxy.threadReference, peekMethod, listOf(peekFluxConsumer!!), ObjectReference.INVOKE_NONVIRTUAL)
+      //obj.invokeMethod(threadReference, peekMethod, listOf(peekFluxConsumer!!), 0)
     } catch (e : Exception) {
       throw e
     }
@@ -90,20 +116,36 @@ class InspectingDebugListener : XDebugSessionListener {
 
   private val logger = logger<InspectingDebugListener>()
   private var exitRequest: MethodExitRequest? = null
-  private lateinit var requestManager: EventRequestManager
+  private var fluxFilteredRequestor: FluxFilteredRequestor? = null
+  private lateinit var eventRequestManager: EventRequestManager
+  private lateinit var requestManager: RequestManagerImpl
   private lateinit var threadProxy: ThreadReferenceProxyImpl
   lateinit var xSession: XDebugSession
   var myEvaluator: XDebuggerEvaluator? = null
   var evalContext: EvaluationContextImpl? = null
 
 
-  private fun createExitRequest(): MethodExitRequest {
+  private fun createRegisterExitRequest() {
+    val requestManagerImpl = requestManager
+    if (exitRequest != null) {
+      requestManagerImpl.deleteRequest(fluxFilteredRequestor)
+    }
+    val methodExitRequest = requestManagerImpl.createMethodExitRequest(fluxFilteredRequestor)
+    methodExitRequest.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD)
+    methodExitRequest.addThreadFilter(threadProxy.threadReference) // todo: perhaps remove
+    methodExitRequest.addClassFilter("reactor.core.publisher.Flux*")
+    requestManagerImpl.enableRequest(methodExitRequest)
+    exitRequest = methodExitRequest
+  }
+
+  private fun createExitRequest(eventRequest: Boolean = true): MethodExitRequest {
     DebuggerManagerThreadImpl.assertIsManagerThread() // to ensure EventRequestManager synchronization
     if (exitRequest != null) {
-      requestManager.deleteEventRequest(exitRequest)
+      eventRequestManager.deleteEventRequest(exitRequest)
     }
-    val methodExitRequest = requestManager.createMethodExitRequest()
-    methodExitRequest.setSuspendPolicy(EventRequest.SUSPEND_ALL)
+    val requestManagerImpl = eventRequestManager
+    val methodExitRequest = requestManagerImpl.createMethodExitRequest()
+    methodExitRequest.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD)
     methodExitRequest.addThreadFilter(threadProxy.threadReference) // todo: perhaps remove
     methodExitRequest.addClassFilter("reactor.core.publisher.Flux*")
     methodExitRequest.enable()
@@ -116,21 +158,34 @@ class InspectingDebugListener : XDebugSessionListener {
     return service.project
   }
 
+  //override fun beforeSessionResume() {
+  //  if (requestPair != null) {
+  //    val returnValue = requestPair!!.second
+  //    val method = DebuggerUtils.findMethod(returnValue.referenceType(), "count", null)
+  //    //returnValue.invokeMethod(threadProxy.threadReference, method, listOf(), 0)
+  //    //requestPair = null
+  //    return
+  //  }
+  //  super.beforeSessionResume()
+  //}
 
   override fun sessionPaused() {
     val service = service<RequesterStorageService>()
     val proj = service.project
     val xDebugProcess = xSession.debugProcess
     val process = DebuggerManager.getInstance(proj).getDebugProcess(xDebugProcess.processHandler)
-
+    if (fluxFilteredRequestor == null) {
+      fluxFilteredRequestor = FluxFilteredRequestor(proj, xSession)
+    }
 
     if (process != null) {
       val vm = process.virtualMachineProxy as VirtualMachineProxyImpl
       if (peekCallInspector != null) {
         return
       }
-      requestManager = vm.eventRequestManager()
+      eventRequestManager = vm.eventRequestManager()
       val processImpl = process as DebugProcessImpl
+      requestManager = processImpl.requestsManager
       val context = processImpl.suspendManager.pausedContext
 
       val threadRef = context.thread!!.threadReference
@@ -141,8 +196,8 @@ class InspectingDebugListener : XDebugSessionListener {
         myEvaluator = eval
       }
 
-
-      DebugProcessEvents.enableRequestWithHandler(createExitRequest(), SwappingOnExitHandler())
+      createRegisterExitRequest()
+      //DebugProcessEvents.enableRequestWithHandler(createExitRequest(), SwappingOnExitHandler())
 
       var ctx = if (context.evaluationContext != null) {
         context.evaluationContext

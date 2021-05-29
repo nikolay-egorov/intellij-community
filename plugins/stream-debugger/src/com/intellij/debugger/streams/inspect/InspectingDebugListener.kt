@@ -35,9 +35,6 @@ class InspectingDebugListener : XDebugSessionListener {
   var peekCallInspector : Value? = null
   var peekFluxConsumer : Value? = null
   val loadedClassMap = mutableMapOf<ClassLoaderHelper.Companion.LoadClasses, Boolean>()
-  val ctxListener = SimpleCtxListener()
-
-  var requestPair: Pair<Method, ObjectReference>? = null
 
   inner class SimpleCtxListener : DebuggerContextListener {
     override fun changeEvent(newContext: DebuggerContextImpl, event: DebuggerSession.Event?) {
@@ -48,28 +45,6 @@ class InspectingDebugListener : XDebugSessionListener {
     }
 
   }
-
-
-  inner class SwappingOnExitHandler : com.intellij.util.Consumer<Event> {
-    override fun consume(e: Event?) {
-      if (e == null) {
-        return
-      }
-
-      val exitEv = e as MethodExitEvent
-      val method = exitEv.method() ?: return
-      val returnValue = exitEv.returnValue() ?: return
-      if (!returnValue.toString().startsWith("instance of")) {
-        return
-      }
-
-      val thread = e.thread()
-      val newValue = createPeekCall(method, returnValue) ?: return
-      threadProxy.forceEarlyReturn(newValue)
-    }
-  }
-
-
 
   private fun createPeekCall(method: Method, returnValue: Value): Value? {
     val obj = returnValue as ObjectReference
@@ -91,24 +66,14 @@ class InspectingDebugListener : XDebugSessionListener {
       //}
 
       if (debugManagerCtx.context.sourcePosition == null) {
-        debugManagerCtx.addListener(ctxListener)
-        requestPair = Pair(method, returnValue)
-        return null
-      } else {
-        debugManagerCtx.removeListener(ctxListener)
       }
       return null
-
 
       // wait() trap is either of them
       evalContext!!.debugProcess.invokeInstanceMethod(ctx, obj, peekMethod!!, listOf(peekFluxConsumer!!), ObjectReference.INVOKE_NONVIRTUAL)
       //obj.invokeMethod(threadReference, peekMethod, listOf(peekFluxConsumer!!), 0)
     } catch (e : Exception) {
       throw e
-    }
-
-    if (shouldResume) {
-      evalContext!!.debugProcess.suspendManager.resume(evalContext!!.suspendContext)
     }
 
     return ans
@@ -131,27 +96,13 @@ class InspectingDebugListener : XDebugSessionListener {
       requestManagerImpl.deleteRequest(fluxFilteredRequestor)
     }
     val methodExitRequest = requestManagerImpl.createMethodExitRequest(fluxFilteredRequestor)
-    methodExitRequest.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD)
+    methodExitRequest.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD) // suspendAll changes nothing
     methodExitRequest.addThreadFilter(threadProxy.threadReference) // todo: perhaps remove
     methodExitRequest.addClassFilter("reactor.core.publisher.Flux*")
     requestManagerImpl.enableRequest(methodExitRequest)
     exitRequest = methodExitRequest
   }
 
-  private fun createExitRequest(eventRequest: Boolean = true): MethodExitRequest {
-    DebuggerManagerThreadImpl.assertIsManagerThread() // to ensure EventRequestManager synchronization
-    if (exitRequest != null) {
-      eventRequestManager.deleteEventRequest(exitRequest)
-    }
-    val requestManagerImpl = eventRequestManager
-    val methodExitRequest = requestManagerImpl.createMethodExitRequest()
-    methodExitRequest.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD)
-    methodExitRequest.addThreadFilter(threadProxy.threadReference) // todo: perhaps remove
-    methodExitRequest.addClassFilter("reactor.core.publisher.Flux*")
-    methodExitRequest.enable()
-    exitRequest = methodExitRequest
-    return exitRequest!!
-  }
 
   private fun getProject(): Project {
     val service = service<RequesterStorageService>()
@@ -213,6 +164,7 @@ class InspectingDebugListener : XDebugSessionListener {
         peekCallInspector = setUpPeekInspector(ctx, classLoader)
         evalContext = ctx
         peekFluxConsumer = setUpPeekConsumer(ctx, classLoader, peekCallInspector as ObjectReference)
+        fluxFilteredRequestor!!.setFluxConsumer(peekFluxConsumer!!)
       }
 
       val a = 1
